@@ -314,6 +314,7 @@ func TestSyncRules(t *testing.T) {
 		ConsulSyncDestinationNamespace string
 		EnableSyncK8SNSMirroring       bool
 		SyncK8SNSMirroringPrefix       string
+		SyncConsulNodeName             string
 		Expected                       string
 	}{
 		{
@@ -322,7 +323,25 @@ func TestSyncRules(t *testing.T) {
 			"sync-namespace",
 			true,
 			"prefix-",
+			"k8s-sync",
 			`node "k8s-sync" {
+    policy = "write"
+  }
+  node_prefix "" {
+    policy = "read"
+  }
+  service_prefix "" {
+    policy = "write"
+  }`,
+		},
+		{
+			"Namespaces are disabled, non-default node name",
+			false,
+			"sync-namespace",
+			true,
+			"prefix-",
+			"new-node-name",
+			`node "new-node-name" {
     policy = "write"
   }
   node_prefix "" {
@@ -338,7 +357,28 @@ func TestSyncRules(t *testing.T) {
 			"sync-namespace",
 			false,
 			"prefix-",
+			"k8s-sync",
 			`node "k8s-sync" {
+    policy = "write"
+  }
+operator = "write"
+namespace "sync-namespace" {
+  node_prefix "" {
+    policy = "read"
+  }
+  service_prefix "" {
+    policy = "write"
+  }
+}`,
+		},
+		{
+			"Namespaces are enabled, mirroring disabled, non-default node name",
+			true,
+			"sync-namespace",
+			false,
+			"prefix-",
+			"new-node-name",
+			`node "new-node-name" {
     policy = "write"
   }
 operator = "write"
@@ -357,7 +397,28 @@ namespace "sync-namespace" {
 			"sync-namespace",
 			true,
 			"",
+			"k8s-sync",
 			`node "k8s-sync" {
+    policy = "write"
+  }
+operator = "write"
+namespace_prefix "" {
+  node_prefix "" {
+    policy = "read"
+  }
+  service_prefix "" {
+    policy = "write"
+  }
+}`,
+		},
+		{
+			"Namespaces are enabled, mirroring enabled, prefix empty, non-default node name",
+			true,
+			"sync-namespace",
+			true,
+			"",
+			"new-node-name",
+			`node "new-node-name" {
     policy = "write"
   }
 operator = "write"
@@ -376,7 +437,28 @@ namespace_prefix "" {
 			"sync-namespace",
 			true,
 			"prefix-",
+			"k8s-sync",
 			`node "k8s-sync" {
+    policy = "write"
+  }
+operator = "write"
+namespace_prefix "prefix-" {
+  node_prefix "" {
+    policy = "read"
+  }
+  service_prefix "" {
+    policy = "write"
+  }
+}`,
+		},
+		{
+			"Namespaces are enabled, mirroring enabled, prefix defined, non-default node name",
+			true,
+			"sync-namespace",
+			true,
+			"prefix-",
+			"new-node-name",
+			`node "new-node-name" {
     policy = "write"
   }
 operator = "write"
@@ -400,6 +482,7 @@ namespace_prefix "prefix-" {
 				flagConsulSyncDestinationNamespace: tt.ConsulSyncDestinationNamespace,
 				flagEnableSyncK8SNSMirroring:       tt.EnableSyncK8SNSMirroring,
 				flagSyncK8SNSMirroringPrefix:       tt.SyncK8SNSMirroringPrefix,
+				flagSyncConsulNodeName:             tt.SyncConsulNodeName,
 			}
 
 			syncRules, err := cmd.syncRules()
@@ -412,20 +495,50 @@ namespace_prefix "prefix-" {
 
 func TestInjectRules(t *testing.T) {
 	cases := []struct {
-		Name             string
-		EnableNamespaces bool
-		Expected         string
+		Name               string
+		EnableNamespaces   bool
+		EnableHealthChecks bool
+		Expected           string
 	}{
 		{
-			"Namespaces are disabled",
+			"Namespaces are disabled, health checks controller disabled",
+			false,
 			false,
 			"",
 		},
 		{
-			"Namespaces are enabled",
+			"Namespaces are enabled, health checks controller disabled",
 			true,
+			false,
 			`
 operator = "write"`,
+		},
+		{
+			"Namespaces are disabled, health checks controller enabled",
+			false,
+			true,
+			`
+node_prefix "" {
+  policy = "write"
+}
+  service_prefix "" {
+    policy = "write"
+  }`,
+		},
+		{
+			"Namespaces are enabled, health checks controller enabled",
+			true,
+			true,
+			`
+operator = "write"
+node_prefix "" {
+  policy = "write"
+}
+namespace_prefix "" {
+  service_prefix "" {
+    policy = "write"
+  }
+}`,
 		},
 	}
 
@@ -434,7 +547,8 @@ operator = "write"`,
 			require := require.New(t)
 
 			cmd := Command{
-				flagEnableNamespaces: tt.EnableNamespaces,
+				flagEnableNamespaces:   tt.EnableNamespaces,
+				flagEnableHealthChecks: tt.EnableHealthChecks,
 			}
 
 			injectorRules, err := cmd.injectRules()
@@ -454,14 +568,14 @@ func TestReplicationTokenRules(t *testing.T) {
 		{
 			"Namespaces are disabled",
 			false,
-			`acl = "write"
-operator = "write"
+			`operator = "write"
 agent_prefix "" {
   policy = "read"
 }
 node_prefix "" {
   policy = "write"
 }
+  acl = "write"
   service_prefix "" {
     policy = "read"
     intentions = "read"
@@ -470,8 +584,7 @@ node_prefix "" {
 		{
 			"Namespaces are enabled",
 			true,
-			`acl = "write"
-operator = "write"
+			`operator = "write"
 agent_prefix "" {
   policy = "read"
 }
@@ -479,6 +592,7 @@ node_prefix "" {
   policy = "write"
 }
 namespace_prefix "" {
+  acl = "write"
   service_prefix "" {
     policy = "read"
     intentions = "read"
@@ -496,6 +610,82 @@ namespace_prefix "" {
 			replicationTokenRules, err := cmd.aclReplicationRules()
 			require.NoError(err)
 			require.Equal(tt.Expected, replicationTokenRules)
+		})
+	}
+}
+
+func TestControllerRules(t *testing.T) {
+	cases := []struct {
+		Name             string
+		EnableNamespaces bool
+		DestConsulNS     string
+		Mirroring        bool
+		MirroringPrefix  string
+		Expected         string
+	}{
+		{
+			Name:             "namespaces=disabled",
+			EnableNamespaces: false,
+			Expected: `operator = "write"
+  service_prefix "" {
+    policy = "write"
+    intentions = "write"
+  }`,
+		},
+		{
+			Name:             "namespaces=enabled, consulDestNS=consul",
+			EnableNamespaces: true,
+			DestConsulNS:     "consul",
+			Expected: `operator = "write"
+namespace "consul" {
+  service_prefix "" {
+    policy = "write"
+    intentions = "write"
+  }
+}`,
+		},
+		{
+			Name:             "namespaces=enabled, mirroring=true",
+			EnableNamespaces: true,
+			Mirroring:        true,
+			Expected: `operator = "write"
+namespace_prefix "" {
+  service_prefix "" {
+    policy = "write"
+    intentions = "write"
+  }
+}`,
+		},
+		{
+			Name:             "namespaces=enabled, mirroring=true, mirroringPrefix=prefix-",
+			EnableNamespaces: true,
+			Mirroring:        true,
+			MirroringPrefix:  "prefix-",
+			Expected: `operator = "write"
+namespace_prefix "prefix-" {
+  service_prefix "" {
+    policy = "write"
+    intentions = "write"
+  }
+}`,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			require := require.New(t)
+
+			cmd := Command{
+				flagEnableNamespaces:                 tt.EnableNamespaces,
+				flagConsulInjectDestinationNamespace: tt.DestConsulNS,
+				flagEnableInjectK8SNSMirroring:       tt.Mirroring,
+				flagInjectK8SNSMirroringPrefix:       tt.MirroringPrefix,
+			}
+
+			rules, err := cmd.controllerRules()
+
+			require.NoError(err)
+			require.Equal(tt.Expected, rules)
 		})
 	}
 }

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	mapset "github.com/deckarep/golang-set"
 	"github.com/hashicorp/consul-k8s/helper/controller"
+	"github.com/hashicorp/consul-k8s/namespaces"
 	consulapi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-hclog"
 	apiv1 "k8s.io/api/core/v1"
@@ -114,6 +116,9 @@ type ServiceResource struct {
 	// `k8s-default` namespace.
 	K8SNSMirroringPrefix string
 
+	// The Consul node name to register service with.
+	ConsulNodeName string
+
 	// serviceLock must be held for any read/write to these maps.
 	serviceLock sync.RWMutex
 
@@ -138,11 +143,11 @@ func (t *ServiceResource) Informer() cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return t.Client.CoreV1().Services(metav1.NamespaceAll).List(options)
+				return t.Client.CoreV1().Services(metav1.NamespaceAll).List(context.TODO(), options)
 			},
 
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return t.Client.CoreV1().Services(metav1.NamespaceAll).Watch(options)
+				return t.Client.CoreV1().Services(metav1.NamespaceAll).Watch(context.TODO(), options)
 			},
 		},
 		&apiv1.Service{},
@@ -186,7 +191,7 @@ func (t *ServiceResource) Upsert(key string, raw interface{}) error {
 	if t.shouldTrackEndpoints(key) {
 		endpoints, err := t.Client.CoreV1().
 			Endpoints(service.Namespace).
-			Get(service.Name, metav1.GetOptions{})
+			Get(context.TODO(), service.Name, metav1.GetOptions{})
 		if err != nil {
 			t.Log.Warn("error loading initial endpoints",
 				"key", key,
@@ -331,7 +336,7 @@ func (t *ServiceResource) generateRegistrations(key string) {
 	// shallow copied for each instance.
 	baseNode := consulapi.CatalogRegistration{
 		SkipNodeUpdate: true,
-		Node:           ConsulSyncNodeName,
+		Node:           t.ConsulNodeName,
 		Address:        "127.0.0.1",
 		NodeMeta: map[string]string{
 			ConsulSourceKey: ConsulSourceValue,
@@ -353,19 +358,14 @@ func (t *ServiceResource) generateRegistrations(key string) {
 	}
 
 	// Update the Consul namespace based on namespace settings
-	if t.EnableNamespaces {
-		var ns string
-
-		// Mirroring takes precedence
-		if t.EnableK8SNSMirroring {
-			ns = fmt.Sprintf("%s%s", t.K8SNSMirroringPrefix, svc.Namespace)
-		} else {
-			ns = t.ConsulDestinationNamespace
-		}
-		t.Log.Debug("[generateRegistrations] namespace being used", "key", key, "namespace", ns)
-
-		// Update baseService to have a Consul namespace
-		baseService.Namespace = ns
+	consulNS := namespaces.ConsulNamespace(svc.Namespace,
+		t.EnableNamespaces,
+		t.ConsulDestinationNamespace,
+		t.EnableK8SNSMirroring,
+		t.K8SNSMirroringPrefix)
+	if consulNS != "" {
+		t.Log.Debug("[generateRegistrations] namespace being used", "key", key, "namespace", consulNS)
+		baseService.Namespace = consulNS
 	}
 
 	// Determine the default port and set port annotations
@@ -526,7 +526,7 @@ func (t *ServiceResource) generateRegistrations(key string) {
 				}
 
 				// Look up the node's ip address by getting node info
-				node, err := t.Client.CoreV1().Nodes().Get(*subsetAddr.NodeName, metav1.GetOptions{})
+				node, err := t.Client.CoreV1().Nodes().Get(context.TODO(), *subsetAddr.NodeName, metav1.GetOptions{})
 				if err != nil {
 					t.Log.Warn("error getting node info", "error", err)
 					continue
@@ -683,13 +683,13 @@ func (t *serviceEndpointsResource) Informer() cache.SharedIndexInformer {
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				return t.Service.Client.CoreV1().
 					Endpoints(metav1.NamespaceAll).
-					List(options)
+					List(context.TODO(), options)
 			},
 
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				return t.Service.Client.CoreV1().
 					Endpoints(metav1.NamespaceAll).
-					Watch(options)
+					Watch(context.TODO(), options)
 			},
 		},
 		&apiv1.Endpoints{},

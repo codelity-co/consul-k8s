@@ -1,6 +1,9 @@
 package synccatalog
 
 import (
+	"context"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -14,6 +17,39 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
+
+// Test flag validation
+func TestRun_FlagValidation(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		Flags  []string
+		ExpErr string
+	}{
+		{
+			Flags: []string{"-consul-node-name=Speci@l_Chars"},
+			ExpErr: "-consul-node-name=Speci@l_Chars is invalid: node name will not be discoverable " +
+				"via DNS due to invalid characters. Valid characters include all alpha-numerics and dashes",
+		},
+		{
+			Flags: []string{"-consul-node-name=5r9OPGfSRXUdGzNjBdAwmhCBrzHDNYs4XjZVR4wp7lSLIzqwS0ta51nBLIN0TMPV-too-long"},
+			ExpErr: "-consul-node-name=5r9OPGfSRXUdGzNjBdAwmhCBrzHDNYs4XjZVR4wp7lSLIzqwS0ta51nBLIN0TMPV-too-long is invalid: node name will not be discoverable " +
+				"via DNS due to it being too long. Valid lengths are between 1 and 63 bytes",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.ExpErr, func(t *testing.T) {
+			ui := cli.NewMockUi()
+			cmd := Command{
+				UI: ui,
+			}
+			responseCode := cmd.Run(c.Flags)
+			require.Equal(t, 1, responseCode, ui.ErrorWriter.String())
+			require.Contains(t, ui.ErrorWriter.String(), c.ExpErr)
+		})
+	}
+}
 
 // Test that the default consul service is synced to k8s
 func TestRun_Defaults_SyncsConsulServiceToK8s(t *testing.T) {
@@ -39,12 +75,54 @@ func TestRun_Defaults_SyncsConsulServiceToK8s(t *testing.T) {
 	defer stopCommand(t, &cmd, exitChan)
 
 	retry.Run(t, func(r *retry.R) {
-		serviceList, err := k8s.CoreV1().Services(metav1.NamespaceDefault).List(metav1.ListOptions{})
+		serviceList, err := k8s.CoreV1().Services(metav1.NamespaceDefault).List(context.Background(), metav1.ListOptions{})
 		require.NoError(r, err)
 		require.Len(r, serviceList.Items, 1)
 		require.Equal(r, "consul", serviceList.Items[0].Name)
 		require.Equal(r, "consul.service.consul", serviceList.Items[0].Spec.ExternalName)
 	})
+}
+
+// Test that the command exits cleanly on signals
+func TestRun_ExitCleanlyOnSignals(t *testing.T) {
+	t.Run("SIGINT", testSignalHandling(syscall.SIGINT))
+	t.Run("SIGTERM", testSignalHandling(syscall.SIGTERM))
+}
+
+func testSignalHandling(sig os.Signal) func(*testing.T) {
+	return func(t *testing.T) {
+		k8s, testServer := completeSetup(t)
+		defer testServer.Stop()
+
+		// Run the command.
+		ui := cli.NewMockUi()
+		cmd := Command{
+			UI:        ui,
+			clientset: k8s,
+			logger: hclog.New(&hclog.LoggerOptions{
+				Name:  t.Name(),
+				Level: hclog.Debug,
+			}),
+		}
+
+		exitChan := runCommandAsynchronously(&cmd, []string{
+			"-http-addr", testServer.HTTPAddr,
+		})
+		cmd.sendSignal(sig)
+
+		// Assert that it exits cleanly or timeout.
+		select {
+		case exitCode := <-exitChan:
+			require.Equal(t, 0, exitCode, ui.ErrorWriter.String())
+
+		// For some reason, this command cannot exit within 1s,
+		// so it's set higher than other tests in other commands
+		// to allow it to exit properly
+		case <-time.After(time.Second * 5):
+			// Fail if the signal was not caught.
+			require.Fail(t, "timeout waiting for command to exit")
+		}
+	}
 }
 
 // Test that when -add-k8s-namespace-suffix flag is used
@@ -74,7 +152,7 @@ func TestRun_ToConsulWithAddK8SNamespaceSuffix(t *testing.T) {
 	}
 
 	// create a service in k8s
-	_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(lbService("foo", "1.1.1.1"))
+	_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(context.Background(), lbService("foo", "1.1.1.1"), metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	exitChan := runCommandAsynchronously(&cmd, []string{
@@ -119,7 +197,7 @@ func TestCommand_Run_ToConsulChangeAddK8SNamespaceSuffixToTrue(t *testing.T) {
 	}
 
 	// create a service in k8s
-	_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(lbService("foo", "1.1.1.1"))
+	_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(context.Background(), lbService("foo", "1.1.1.1"), metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	exitChan := runCommandAsynchronously(&cmd, []string{
@@ -179,10 +257,10 @@ func TestCommand_Run_ToConsulTwoServicesSameNameDifferentNamespace(t *testing.T)
 	}
 
 	// create two services in k8s
-	_, err = k8s.CoreV1().Services("bar").Create(lbService("foo", "1.1.1.1"))
+	_, err = k8s.CoreV1().Services("bar").Create(context.Background(), lbService("foo", "1.1.1.1"), metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	_, err = k8s.CoreV1().Services("baz").Create(lbService("foo", "2.2.2.2"))
+	_, err = k8s.CoreV1().Services("baz").Create(context.Background(), lbService("foo", "2.2.2.2"), metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	exitChan := runCommandAsynchronously(&cmd, []string{
@@ -261,15 +339,18 @@ func TestRun_ToConsulAllowDenyLists(t *testing.T) {
 
 			// Create two services in k8s in default and foo namespaces.
 			{
-				_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(lbService("default", "1.1.1.1"))
+				_, err = k8s.CoreV1().Services(metav1.NamespaceDefault).Create(context.Background(), lbService("default", "1.1.1.1"), metav1.CreateOptions{})
 				require.NoError(tt, err)
-				_, err = k8s.CoreV1().Namespaces().Create(&apiv1.Namespace{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "foo",
+				_, err = k8s.CoreV1().Namespaces().Create(
+					context.Background(),
+					&apiv1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "foo",
+						},
 					},
-				})
+					metav1.CreateOptions{})
 				require.NoError(tt, err)
-				_, err = k8s.CoreV1().Services("foo").Create(lbService("foo", "1.1.1.1"))
+				_, err = k8s.CoreV1().Services("foo").Create(context.Background(), lbService("foo", "1.1.1.1"), metav1.CreateOptions{})
 				require.NoError(tt, err)
 			}
 
@@ -414,15 +495,18 @@ func TestRun_ToConsulChangingFlags(t *testing.T) {
 
 			// Create two services in k8s in default and foo namespaces.
 			{
-				_, err := k8s.CoreV1().Services(metav1.NamespaceDefault).Create(lbService("default", "1.1.1.1"))
+				_, err := k8s.CoreV1().Services(metav1.NamespaceDefault).Create(context.Background(), lbService("default", "1.1.1.1"), metav1.CreateOptions{})
 				require.NoError(tt, err)
-				_, err = k8s.CoreV1().Namespaces().Create(&apiv1.Namespace{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "foo",
+				_, err = k8s.CoreV1().Namespaces().Create(
+					context.Background(),
+					&apiv1.Namespace{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "foo",
+						},
 					},
-				})
+					metav1.CreateOptions{})
 				require.NoError(tt, err)
-				_, err = k8s.CoreV1().Services("foo").Create(lbService("foo", "1.1.1.1"))
+				_, err = k8s.CoreV1().Services("foo").Create(context.Background(), lbService("foo", "1.1.1.1"), metav1.CreateOptions{})
 				require.NoError(tt, err)
 			}
 
@@ -494,7 +578,7 @@ func TestRun_ToConsulChangingFlags(t *testing.T) {
 func completeSetup(t *testing.T) (*fake.Clientset, *testutil.TestServer) {
 	k8s := fake.NewSimpleClientset()
 
-	svr, err := testutil.NewTestServerT(t)
+	svr, err := testutil.NewTestServerConfigT(t, nil)
 	require.NoError(t, err)
 
 	return k8s, svr

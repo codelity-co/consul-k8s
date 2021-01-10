@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/deckarep/golang-set"
@@ -15,6 +17,7 @@ import (
 	catalogtok8s "github.com/hashicorp/consul-k8s/catalog/to-k8s"
 	"github.com/hashicorp/consul-k8s/helper/controller"
 	"github.com/hashicorp/consul-k8s/subcommand"
+	"github.com/hashicorp/consul-k8s/subcommand/common"
 	"github.com/hashicorp/consul-k8s/subcommand/flags"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-hclog"
@@ -37,6 +40,7 @@ type Command struct {
 	flagToK8S                 bool
 	flagConsulDomain          string
 	flagConsulK8STag          string
+	flagConsulNodeName        string
 	flagK8SDefault            bool
 	flagK8SServicePrefix      string
 	flagConsulServicePrefix   string
@@ -95,6 +99,9 @@ func (c *Command) init() {
 			"Kubernetes. Defaults to consul.")
 	c.flags.StringVar(&c.flagConsulK8STag, "consul-k8s-tag", "k8s",
 		"Tag value for K8S services registered in Consul")
+	c.flags.StringVar(&c.flagConsulNodeName, "consul-node-name", "k8s-sync",
+		"The Consul node name to register for catalog sync. Defaults to k8s-sync. To be discoverable "+
+			"via DNS, the name should only contain alpha-numerics and dashes.")
 	c.flags.DurationVar(&c.flagConsulWritePeriod, "consul-write-interval", 30*time.Second,
 		"The interval to perform syncing operations creating Consul services, formatted "+
 			"as a time.Duration. All changes are merged and write calls are only made "+
@@ -115,17 +122,18 @@ func (c *Command) init() {
 	c.flags.StringVar(&c.flagLogLevel, "log-level", "info",
 		"Log verbosity level. Supported values (in order of detail) are \"trace\", "+
 			"\"debug\", \"info\", \"warn\", and \"error\".")
+
 	c.flags.Var((*flags.AppendSliceValue)(&c.flagAllowK8sNamespacesList), "allow-k8s-namespace",
 		"K8s namespaces to explicitly allow. May be specified multiple times.")
 	c.flags.Var((*flags.AppendSliceValue)(&c.flagDenyK8sNamespacesList), "deny-k8s-namespace",
 		"K8s namespaces to explicitly deny. Takes precedence over allow. May be specified multiple times.")
 	c.flags.BoolVar(&c.flagEnableNamespaces, "enable-namespaces", false,
-		"[Enterprise Only] Enables namespaces, in either a single Consul namespace or mirrored")
+		"[Enterprise Only] Enables namespaces, in either a single Consul namespace or mirrored.")
 	c.flags.StringVar(&c.flagConsulDestinationNamespace, "consul-destination-namespace", "default",
-		"[Enterprise Only] Defines which Consul namespace to register all synced services into. If 'enable-namespace-mirroring' "+
+		"[Enterprise Only] Defines which Consul namespace to register all synced services into. If '-enable-k8s-namespace-mirroring' "+
 			"is true, this is not used.")
 	c.flags.BoolVar(&c.flagEnableK8SNSMirroring, "enable-k8s-namespace-mirroring", false, "[Enterprise Only] Enables "+
-		"namespace mirroring")
+		"namespace mirroring.")
 	c.flags.StringVar(&c.flagK8SNSMirroringPrefix, "k8s-namespace-mirroring-prefix", "",
 		"[Enterprise Only] Prefix that will be added to all k8s namespaces mirrored into Consul if mirroring is enabled.")
 	c.flags.StringVar(&c.flagCrossNamespaceACLPolicy, "consul-cross-namespace-acl-policy", "",
@@ -139,12 +147,12 @@ func (c *Command) init() {
 
 	c.help = flags.Usage(help, c.flags)
 
-	// Wait on an interrupt to exit. This channel must be initialized before
+	// Wait on an interrupt or terminate to exit. This channel must be initialized before
 	// Run() is called so that there are no race conditions where the channel
 	// is not defined.
 	if c.sigCh == nil {
 		c.sigCh = make(chan os.Signal, 1)
-		signal.Notify(c.sigCh, os.Interrupt)
+		signal.Notify(c.sigCh, syscall.SIGINT, syscall.SIGTERM)
 	}
 }
 
@@ -155,6 +163,12 @@ func (c *Command) Run(args []string) int {
 	}
 	if len(c.flags.Args()) > 0 {
 		c.UI.Error(fmt.Sprintf("Should have no non-flag arguments."))
+		return 1
+	}
+
+	// Validate flags
+	if err := c.validateFlags(); err != nil {
+		c.UI.Error(err.Error())
 		return 1
 	}
 
@@ -185,31 +199,21 @@ func (c *Command) Run(args []string) int {
 
 	// Set up logging
 	if c.logger == nil {
-		level := hclog.LevelFromString(c.flagLogLevel)
-		if level == hclog.NoLevel {
-			c.UI.Error(fmt.Sprintf("Unknown log level: %s", c.flagLogLevel))
+		var err error
+		c.logger, err = common.Logger(c.flagLogLevel)
+		if err != nil {
+			c.UI.Error(err.Error())
 			return 1
 		}
-		c.logger = hclog.New(&hclog.LoggerOptions{
-			Level:  level,
-			Output: os.Stderr,
-		})
 	}
 
 	// Convert allow/deny lists to sets
-	allowSet := mapset.NewSet()
-	denySet := mapset.NewSet()
+	allowSet := flags.ToSet(c.flagAllowK8sNamespacesList)
+	denySet := flags.ToSet(c.flagDenyK8sNamespacesList)
 	if c.flagK8SSourceNamespace != "" {
 		// For backwards compatibility, if `flagK8SSourceNamespace` is set,
 		// it will be the only allowed namespace
-		allowSet.Add(c.flagK8SSourceNamespace)
-	} else {
-		for _, allow := range c.flagAllowK8sNamespacesList {
-			allowSet.Add(allow)
-		}
-		for _, deny := range c.flagDenyK8sNamespacesList {
-			denySet.Add(deny)
-		}
+		allowSet = mapset.NewSet(c.flagK8SSourceNamespace)
 	}
 	c.logger.Info("K8s namespace syncing configuration", "k8s namespaces allowed to be synced", allowSet,
 		"k8s namespaces denied from syncing", denySet)
@@ -243,6 +247,7 @@ func (c *Command) Run(args []string) int {
 			SyncPeriod:               c.flagConsulWritePeriod,
 			ServicePollPeriod:        c.flagConsulWritePeriod * 2,
 			ConsulK8STag:             c.flagConsulK8STag,
+			ConsulNodeName:           c.flagConsulNodeName,
 			ConsulNodeServicesClient: svcsClient,
 		}
 		go syncer.Run(ctx)
@@ -267,6 +272,7 @@ func (c *Command) Run(args []string) int {
 				ConsulDestinationNamespace: c.flagConsulDestinationNamespace,
 				EnableK8SNSMirroring:       c.flagEnableK8SNSMirroring,
 				K8SNSMirroringPrefix:       c.flagK8SNSMirroringPrefix,
+				ConsulNodeName:             c.flagConsulNodeName,
 			},
 		}
 
@@ -338,8 +344,9 @@ func (c *Command) Run(args []string) int {
 		}
 		return 1
 
-	// Interrupted, gracefully exit
-	case <-c.sigCh:
+	// Interrupted/terminated, gracefully exit
+	case sig := <-c.sigCh:
+		c.logger.Info(fmt.Sprintf("%s received, shutting down", sig))
 		cancelF()
 		if toConsulCh != nil {
 			<-toConsulCh
@@ -372,7 +379,34 @@ func (c *Command) Help() string {
 // interrupt sends os.Interrupt signal to the command
 // so it can exit gracefully. This function is needed for tests
 func (c *Command) interrupt() {
-	c.sigCh <- os.Interrupt
+	c.sendSignal(syscall.SIGINT)
+}
+
+func (c *Command) sendSignal(sig os.Signal) {
+	c.sigCh <- sig
+}
+
+func (c *Command) validateFlags() error {
+	// For the Consul node name to be discoverable via DNS, it must contain only
+	// dashes and alphanumeric characters. Length is also constrained.
+	// These restrictions match those defined in Consul's agent definition.
+	var invalidDnsRe = regexp.MustCompile(`[^A-Za-z0-9\\-]+`)
+	const maxDNSLabelLength = 63
+
+	if invalidDnsRe.MatchString(c.flagConsulNodeName) {
+		return fmt.Errorf("-consul-node-name=%s is invalid: node name will not be discoverable "+
+			"via DNS due to invalid characters. Valid characters include all alpha-numerics and dashes",
+			c.flagConsulNodeName,
+		)
+	}
+	if len(c.flagConsulNodeName) > maxDNSLabelLength {
+		return fmt.Errorf("-consul-node-name=%s is invalid: node name will not be discoverable "+
+			"via DNS due to it being too long. Valid lengths are between 1 and 63 bytes",
+			c.flagConsulNodeName,
+		)
+	}
+
+	return nil
 }
 
 const synopsis = "Sync Kubernetes services and Consul services."

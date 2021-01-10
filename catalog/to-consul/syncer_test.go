@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,12 +15,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	// ConsulSyncNodeName is the name of the node in Consul that we register
+	// services on. It's not a real node backed by a Consul agent.
+	ConsulSyncNodeName = "k8s-sync"
+)
+
 func TestConsulSyncer_register(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
 
 	// Set up server, client, syncer
-	a, err := testutil.NewTestServerT(t)
+	a, err := testutil.NewTestServerConfigT(t, nil)
 	require.NoError(err)
 	defer a.Stop()
 
@@ -58,61 +65,67 @@ func TestConsulSyncer_register(t *testing.T) {
 // Test that the syncer reaps individual invalid service instances.
 func TestConsulSyncer_reapServiceInstance(t *testing.T) {
 	t.Parallel()
-	require := require.New(t)
 
-	// Set up server, client, syncer
-	a, err := testutil.NewTestServerT(t)
-	require.NoError(err)
-	defer a.Stop()
+	for _, node := range []string{ConsulSyncNodeName, "test-node"} {
+		name := fmt.Sprintf("consul node name: %s", node)
+		t.Run(name, func(t *testing.T) {
+			require := require.New(t)
 
-	client, err := api.NewClient(&api.Config{
-		Address: a.HTTPAddr,
-	})
-	require.NoError(err)
+			// Set up server, client, syncer
+			a, err := testutil.NewTestServerConfigT(t, nil)
+			require.NoError(err)
+			defer a.Stop()
 
-	s, closer := testConsulSyncer(client)
-	defer closer()
+			client, err := api.NewClient(&api.Config{
+				Address: a.HTTPAddr,
+			})
+			require.NoError(err)
 
-	// Sync
-	s.Sync([]*api.CatalogRegistration{
-		testRegistration(ConsulSyncNodeName, "bar", "default"),
-	})
+			s, closer := testConsulSyncer(client)
+			defer closer()
 
-	// Wait for the first service
-	retry.Run(t, func(r *retry.R) {
-		services, _, err := client.Catalog().Service("bar", "", nil)
-		if err != nil {
-			r.Fatalf("err: %s", err)
-		}
-		if len(services) != 1 {
-			r.Fatal("service not found or too many")
-		}
-	})
+			// Sync
+			s.Sync([]*api.CatalogRegistration{
+				testRegistration(node, "bar", "default"),
+			})
 
-	// Create an invalid service directly in Consul
-	svc := testRegistration(ConsulSyncNodeName, "bar", "default")
-	svc.Service.ID = serviceID("k8s-sync", "bar2")
-	_, err = client.Catalog().Register(svc, nil)
-	require.NoError(err)
+			// Wait for the first service
+			retry.Run(t, func(r *retry.R) {
+				services, _, err := client.Catalog().Service("bar", "", nil)
+				if err != nil {
+					r.Fatalf("err: %s", err)
+				}
+				if len(services) != 1 {
+					r.Fatal("service not found or too many")
+				}
+			})
 
-	// Valid service should exist
-	var service *api.CatalogService
-	retry.Run(t, func(r *retry.R) {
-		services, _, err := client.Catalog().Service("bar", "", nil)
-		if err != nil {
-			r.Fatalf("err: %s", err)
-		}
-		if len(services) != 1 {
-			r.Fatal("service not found or too many")
-		}
-		service = services[0]
-	})
+			// Create an invalid service directly in Consul
+			svc := testRegistration(node, "bar", "default")
+			svc.Service.ID = serviceID(node, "bar2")
+			_, err = client.Catalog().Register(svc, nil)
+			require.NoError(err)
 
-	// Verify the settings
-	require.Equal(serviceID("k8s-sync", "bar"), service.ServiceID)
-	require.Equal("k8s-sync", service.Node)
-	require.Equal("bar", service.ServiceName)
-	require.Equal("127.0.0.1", service.Address)
+			// Valid service should exist
+			var service *api.CatalogService
+			retry.Run(t, func(r *retry.R) {
+				services, _, err := client.Catalog().Service("bar", "", nil)
+				if err != nil {
+					r.Fatalf("err: %s", err)
+				}
+				if len(services) != 1 {
+					r.Fatal("service not found or too many")
+				}
+				service = services[0]
+			})
+
+			// Verify the settings
+			require.Equal(serviceID(node, "bar"), service.ServiceID)
+			require.Equal(node, service.Node)
+			require.Equal("bar", service.ServiceName)
+			require.Equal("127.0.0.1", service.Address)
+		})
+	}
 }
 
 // Test that the syncer reaps services not registered by us that are tagged
@@ -124,7 +137,7 @@ func TestConsulSyncer_reapService(t *testing.T) {
 	for _, k8sNS := range sourceK8sNamespaceAnnotations {
 		t.Run(k8sNS, func(tt *testing.T) {
 			// Set up server, client, syncer
-			a, err := testutil.NewTestServerT(tt)
+			a, err := testutil.NewTestServerConfigT(tt, nil)
 			require.NoError(tt, err)
 			defer a.Stop()
 
@@ -172,7 +185,7 @@ func TestConsulSyncer_reapService(t *testing.T) {
 func TestConsulSyncer_noReapingUntilInitialSync(t *testing.T) {
 	t.Parallel()
 
-	a, err := testutil.NewTestServerT(t)
+	a, err := testutil.NewTestServerConfigT(t, nil)
 	require.NoError(t, err)
 	defer a.Stop()
 	client, err := api.NewClient(&api.Config{
@@ -282,6 +295,7 @@ func testConsulSyncerWithConfig(client *api.Client, configurator func(*ConsulSyn
 		SyncPeriod:        200 * time.Millisecond,
 		ServicePollPeriod: 50 * time.Millisecond,
 		ConsulK8STag:      TestConsulK8STag,
+		ConsulNodeName:    ConsulSyncNodeName,
 		ConsulNodeServicesClient: &PreNamespacesNodeServicesClient{
 			Client: client,
 		},

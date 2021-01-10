@@ -4,19 +4,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/hashicorp/consul-k8s/subcommand"
+	"github.com/hashicorp/consul-k8s/subcommand/common"
 	"github.com/hashicorp/consul-k8s/subcommand/flags"
-	"github.com/hashicorp/go-hclog"
 	"github.com/mitchellh/cli"
 	v1 "k8s.io/api/batch/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	"os"
-	"sync"
-	"time"
 )
+
+const logLevel = "info"
 
 // Command is the command for deleting completed jobs.
 type Command struct {
@@ -94,15 +96,16 @@ func (c *Command) Run(args []string) int {
 		}
 	}
 
-	logger := hclog.New(&hclog.LoggerOptions{
-		Level:  hclog.Info,
-		Output: os.Stderr,
-	})
+	logger, err := common.Logger(logLevel)
+	if err != nil {
+		c.UI.Error(err.Error())
+		return 1
+	}
 
 	// Wait for job to complete.
 	logger.Info(fmt.Sprintf("waiting for job %q to complete successfully", jobName))
 	for {
-		job, err := c.k8sClient.BatchV1().Jobs(c.flagNamespace).Get(jobName, metav1.GetOptions{})
+		job, err := c.k8sClient.BatchV1().Jobs(c.flagNamespace).Get(context.TODO(), jobName, metav1.GetOptions{})
 		if k8serrors.IsNotFound(err) {
 			logger.Info(fmt.Sprintf("job %q does not exist, no need to delete", jobName))
 			return 0
@@ -141,7 +144,7 @@ func (c *Command) Run(args []string) int {
 	// ourselves.
 	logger.Info(fmt.Sprintf("job %q has succeeded, deleting", jobName))
 	propagationPolicy := metav1.DeletePropagationForeground
-	err = c.k8sClient.BatchV1().Jobs(c.flagNamespace).Delete(jobName, &metav1.DeleteOptions{
+	err = c.k8sClient.BatchV1().Jobs(c.flagNamespace).Delete(context.TODO(), jobName, metav1.DeleteOptions{
 		// Needed so that the underlying pods are also deleted.
 		PropagationPolicy: &propagationPolicy,
 	})

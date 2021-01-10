@@ -1,9 +1,11 @@
 package serveraclinit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
+	"github.com/hashicorp/consul-k8s/namespaces"
 	"github.com/hashicorp/consul/api"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +19,7 @@ const defaultKubernetesHost = "https://kubernetes.default.svc"
 
 // configureConnectInject sets up auth methods so that connect injection will
 // work.
-func (c *Command) configureConnectInject(consulClient *api.Client) error {
+func (c *Command) configureConnectInjectAuthMethod(consulClient *api.Client) error {
 
 	authMethodName := c.withPrefix("k8s-auth-method")
 
@@ -45,7 +47,7 @@ func (c *Command) configureConnectInject(consulClient *api.Client) error {
 			err = c.untilSucceeds(fmt.Sprintf("checking or creating namespace %s",
 				c.flagConsulInjectDestinationNamespace),
 				func() error {
-					err := c.checkAndCreateNamespace(c.flagConsulInjectDestinationNamespace, consulClient)
+					_, err := namespaces.EnsureExists(consulClient, c.flagConsulInjectDestinationNamespace, "cross-namespace-policy")
 					return err
 				})
 			if err != nil {
@@ -116,7 +118,7 @@ func (c *Command) configureConnectInject(consulClient *api.Client) error {
 		// for this auth method, but none that match the binding
 		// rule set up here in the bootstrap method.
 		if abr.ID == "" {
-			return errors.New("Unable to find a matching ACL binding rule to update")
+			return errors.New("unable to find a matching ACL binding rule to update")
 		}
 
 		err = c.untilSucceeds(fmt.Sprintf("updating acl binding rule for %s", authMethodName),
@@ -142,7 +144,7 @@ func (c *Command) createAuthMethodTmpl(authMethodName string) (api.ACLAuthMethod
 	err := c.untilSucceeds(fmt.Sprintf("getting %s ServiceAccount", saName),
 		func() error {
 			var err error
-			authMethodServiceAccount, err = c.clientset.CoreV1().ServiceAccounts(c.flagK8sNamespace).Get(saName, metav1.GetOptions{})
+			authMethodServiceAccount, err = c.clientset.CoreV1().ServiceAccounts(c.flagK8sNamespace).Get(context.TODO(), saName, metav1.GetOptions{})
 			return err
 		})
 	if err != nil {
@@ -151,18 +153,30 @@ func (c *Command) createAuthMethodTmpl(authMethodName string) (api.ACLAuthMethod
 
 	// ServiceAccounts always have a secret name. The secret
 	// contains the JWT token.
-	saSecretName := authMethodServiceAccount.Secrets[0].Name
-
-	// Get the secret that will contain the ServiceAccount JWT token.
+	// Because there could be multiple secrets attached to the service account,
+	// we need pick the first one of type "kubernetes.io/service-account-token".
 	var saSecret *apiv1.Secret
-	err = c.untilSucceeds(fmt.Sprintf("getting %s Secret", saSecretName),
-		func() error {
-			var err error
-			saSecret, err = c.clientset.CoreV1().Secrets(c.flagK8sNamespace).Get(saSecretName, metav1.GetOptions{})
-			return err
-		})
+	for _, secretRef := range authMethodServiceAccount.Secrets {
+		var secret *apiv1.Secret
+		err = c.untilSucceeds(fmt.Sprintf("getting %s Secret", secretRef.Name),
+			func() error {
+				var err error
+				secret, err = c.clientset.CoreV1().Secrets(c.flagK8sNamespace).Get(context.TODO(), secretRef.Name, metav1.GetOptions{})
+				return err
+			})
+		if secret != nil && secret.Type == apiv1.SecretTypeServiceAccountToken {
+			saSecret = secret
+			break
+		}
+	}
 	if err != nil {
 		return api.ACLAuthMethod{}, err
+	}
+	// This is very unlikely to happen because Kubernetes ensure that there is always
+	// a secret of type ServiceAccountToken.
+	if saSecret == nil {
+		return api.ACLAuthMethod{},
+			fmt.Errorf("found no secret of type 'kubernetes.io/service-account-token' associated with the %s service account", saName)
 	}
 
 	kubernetesHost := defaultKubernetesHost

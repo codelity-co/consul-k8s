@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +24,53 @@ func TestRun_Defaults(t *testing.T) {
 	require.Equal(t, 10*time.Second, cmd.flagSyncPeriod)
 	require.Equal(t, "info", cmd.flagLogLevel)
 	require.Equal(t, "consul", cmd.flagConsulBinary)
+}
+
+func TestRun_ExitsCleanlyonSignals(t *testing.T) {
+	t.Run("SIGINT", testRunSignalHandling(syscall.SIGINT))
+	t.Run("SIGTERM", testRunSignalHandling(syscall.SIGTERM))
+}
+
+func testRunSignalHandling(sig os.Signal) func(*testing.T) {
+	return func(t *testing.T) {
+		tmpDir, configFile := createServicesTmpFile(t, servicesRegistration)
+		defer os.RemoveAll(tmpDir)
+
+		a, err := testutil.NewTestServerConfigT(t, nil)
+		require.NoError(t, err)
+		defer a.Stop()
+
+		ui := cli.NewMockUi()
+		cmd := Command{
+			UI: ui,
+		}
+
+		client, err := api.NewClient(&api.Config{
+			Address: a.HTTPAddr,
+		})
+		require.NoError(t, err)
+		// Run async because we need to kill it when the test is over.
+		exitChan := runCommandAsynchronously(&cmd, []string{
+			"-service-config", configFile,
+			"-http-addr", a.HTTPAddr,
+			"-sync-period", "1s",
+		})
+		cmd.sendSignal(sig)
+
+		// Assert that it exits cleanly or timeout.
+		select {
+		case exitCode := <-exitChan:
+			require.Equal(t, 0, exitCode, ui.ErrorWriter.String())
+		case <-time.After(time.Second * 1):
+			// Fail if the signal was not caught.
+			require.Fail(t, "timeout waiting for command to exit")
+		}
+		// Assert that the services were not created because the cmd has exited.
+		_, _, err = client.Agent().Service("service-id", nil)
+		require.Error(t, err)
+		_, _, err = client.Agent().Service("service-id-sidecar-proxy", nil)
+		require.Error(t, err)
+	}
 }
 
 func TestRun_FlagValidation(t *testing.T) {
@@ -116,7 +164,7 @@ func TestRun_ServicesRegistration(t *testing.T) {
 	tmpDir, configFile := createServicesTmpFile(t, servicesRegistration)
 	defer os.RemoveAll(tmpDir)
 
-	a, err := testutil.NewTestServerT(t)
+	a, err := testutil.NewTestServerConfigT(t, nil)
 	require.NoError(t, err)
 	defer a.Stop()
 
@@ -211,7 +259,7 @@ func TestRun_ConsulCommandFlags(t *testing.T) {
 	tmpDir, configFile := createServicesTmpFile(t, servicesRegistration)
 	defer os.RemoveAll(tmpDir)
 
-	a, err := testutil.NewTestServerT(t)
+	a, err := testutil.NewTestServerConfigT(t, nil)
 	require.NoError(t, err)
 	defer a.Stop()
 

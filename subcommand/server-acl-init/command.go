@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +38,15 @@ type Command struct {
 
 	flagCreateClientToken bool
 
-	flagCreateSyncToken bool
+	flagCreateSyncToken    bool
+	flagSyncConsulNodeName string
 
 	flagCreateInjectToken      bool
 	flagCreateInjectAuthMethod bool
 	flagInjectAuthMethodHost   string
 	flagBindingRuleSelector    string
+
+	flagCreateControllerToken bool
 
 	flagCreateEntLicenseToken bool
 
@@ -76,6 +79,9 @@ type Command struct {
 	// Flag to support a custom bootstrap token
 	flagBootstrapTokenFile string
 
+	// Flag to indicate that the health checks controller is enabled.
+	flagEnableHealthChecks bool
+
 	flagLogLevel string
 	flagTimeout  time.Duration
 
@@ -105,20 +111,34 @@ func (c *Command) init() {
 		"Toggle for updating the anonymous token to allow DNS queries to work")
 	c.flags.BoolVar(&c.flagCreateClientToken, "create-client-token", true,
 		"Toggle for creating a client agent token. Default is true.")
+
 	c.flags.BoolVar(&c.flagCreateSyncToken, "create-sync-token", false,
 		"Toggle for creating a catalog sync token.")
+	c.flags.StringVar(&c.flagSyncConsulNodeName, "sync-consul-node-name", "k8s-sync",
+		"The Consul node name to register for catalog sync. Defaults to k8s-sync. To be discoverable "+
+			"via DNS, the name should only contain alpha-numerics and dashes.")
 
-	c.flags.BoolVar(&c.flagCreateInjectToken, "create-inject-namespace-token", false,
-		"Toggle for creating a connect injector token. Only required when namespaces are enabled.")
-	c.flags.BoolVar(&c.flagCreateInjectAuthMethod, "create-inject-auth-method", false,
-		"Toggle for creating a connect inject auth method.")
-	c.flags.BoolVar(&c.flagCreateInjectAuthMethod, "create-inject-token", false,
-		"Toggle for creating a connect inject auth method. Deprecated: use -create-inject-auth-method instead.")
+	// Previously when this flag was set, -enable-namespaces and -create-inject-auth-method
+	// were always passed, so now we just look at those flags and ignore
+	// this flag. We keep the flag here though so there's no error if it's
+	// passed.
+	var unused bool
+	c.flags.BoolVar(&unused, "create-inject-namespace-token", false,
+		"Toggle for creating a connect injector token. Only required when namespaces are enabled. "+
+			"Deprecated: set -enable-namespaces and -create-inject-token instead.")
+
+	c.flags.BoolVar(&c.flagCreateInjectToken, "create-inject-auth-method", false,
+		"Toggle for creating a connect inject auth method. Deprecated: use -create-inject-token instead.")
+	c.flags.BoolVar(&c.flagCreateInjectToken, "create-inject-token", false,
+		"Toggle for creating a connect inject auth method and an ACL token. The ACL token will only be created if either of the -enable-namespaces or -enable-health-checks flags is set.")
 	c.flags.StringVar(&c.flagInjectAuthMethodHost, "inject-auth-method-host", "",
 		"Kubernetes Host config parameter for the auth method."+
 			"If not provided, the default cluster Kubernetes service will be used.")
 	c.flags.StringVar(&c.flagBindingRuleSelector, "acl-binding-rule-selector", "",
 		"Selector string for connectInject ACL Binding Rule.")
+
+	c.flags.BoolVar(&c.flagCreateControllerToken, "create-controller-token", false,
+		"Toggle for creating a token for the controller.")
 
 	c.flags.BoolVar(&c.flagCreateEntLicenseToken, "create-enterprise-license-token", false,
 		"Toggle for creating a token for the enterprise license job.")
@@ -174,6 +194,9 @@ func (c *Command) init() {
 		"Path to file containing ACL token for creating policies and tokens. This token must have 'acl:write' permissions."+
 			"When provided, servers will not be bootstrapped and their policies and tokens will not be updated.")
 
+	c.flags.BoolVar(&c.flagEnableHealthChecks, "enable-health-checks", false,
+		"Toggle for adding ACL rules for the health check controller to the connect ACL token. Requires -create-inject-token to be also be set.")
+
 	c.flags.DurationVar(&c.flagTimeout, "timeout", 10*time.Minute,
 		"How long we'll try to bootstrap ACLs for before timing out, e.g. 1ms, 2s, 3m")
 	c.flags.StringVar(&c.flagLogLevel, "log-level", "info",
@@ -210,12 +233,10 @@ func (c *Command) Run(args []string) int {
 		c.UI.Error("Should have no non-flag arguments.")
 		return 1
 	}
-	if len(c.flagServerAddresses) == 0 {
-		c.UI.Error("-server-address must be set at least once")
-		return 1
-	}
-	if c.flagResourcePrefix == "" {
-		c.UI.Error("-resource-prefix must be set")
+
+	// Validate flags
+	if err := c.validateFlags(); err != nil {
+		c.UI.Error(err.Error())
 		return 1
 	}
 
@@ -254,16 +275,12 @@ func (c *Command) Run(args []string) int {
 	// The context will only ever be intentionally ended by the timeout.
 	defer cancel()
 
-	// Configure our logger
-	level := hclog.LevelFromString(c.flagLogLevel)
-	if level == hclog.NoLevel {
-		c.UI.Error(fmt.Sprintf("Unknown log level: %s", c.flagLogLevel))
+	var err error
+	c.log, err = common.Logger(c.flagLogLevel)
+	if err != nil {
+		c.UI.Error(err.Error())
 		return 1
 	}
-	c.log = hclog.New(&hclog.LoggerOptions{
-		Level:  level,
-		Output: os.Stderr,
-	})
 
 	serverAddresses := c.flagServerAddresses
 	// Check if the provided addresses contain a cloud-auto join string.
@@ -401,7 +418,13 @@ func (c *Command) Run(args []string) int {
 		}
 		_, _, err = consulClient.Namespaces().Update(&consulNamespace, &api.WriteOptions{})
 		if err != nil {
-			c.log.Error("Error updating the default namespace to include the cross namespace policy", "err", err)
+			if strings.Contains(strings.ToLower(err.Error()), "unexpected response code: 404") {
+				// If this returns a 404 it's most likely because they're not running
+				// Consul Enterprise.
+				c.log.Error("Error updating the default namespace to include the cross namespace policy - ensure you're running Consul Enterprise with namespaces enabled", "err", err)
+			} else {
+				c.log.Error("Error updating the default namespace to include the cross namespace policy", "err", err)
+			}
 			return 1
 		}
 	}
@@ -449,23 +472,33 @@ func (c *Command) Run(args []string) int {
 	}
 
 	if c.flagCreateInjectToken {
-		injectRules, err := c.injectRules()
-		if err != nil {
-			c.log.Error("Error templating inject rules", "err", err)
-			return 1
-		}
-
-		// If namespaces are enabled, the policy and token needs to be global
-		// to be allowed to create namespaces.
-		if c.flagEnableNamespaces {
-			err = c.createGlobalACL("connect-inject", injectRules, consulDC, consulClient)
-		} else {
-			err = c.createLocalACL("connect-inject", injectRules, consulDC, consulClient)
-		}
-
+		err := c.configureConnectInjectAuthMethod(consulClient)
 		if err != nil {
 			c.log.Error(err.Error())
 			return 1
+		}
+
+		// If health checks or namespaces are enabled,
+		// then the connect injector needs an ACL token.
+		if c.flagEnableNamespaces || c.flagEnableHealthChecks {
+			injectRules, err := c.injectRules()
+			if err != nil {
+				c.log.Error("Error templating inject rules", "err", err)
+				return 1
+			}
+
+			// If namespaces are enabled, the policy and token need to be global
+			// to be allowed to create namespaces.
+			if c.flagEnableNamespaces {
+				err = c.createGlobalACL("connect-inject", injectRules, consulDC, consulClient)
+			} else {
+				err = c.createLocalACL("connect-inject", injectRules, consulDC, consulClient)
+			}
+
+			if err != nil {
+				c.log.Error(err.Error())
+				return 1
+			}
 		}
 	}
 
@@ -613,14 +646,6 @@ func (c *Command) Run(args []string) int {
 		}
 	}
 
-	if c.flagCreateInjectAuthMethod {
-		err := c.configureConnectInject(consulClient)
-		if err != nil {
-			c.log.Error(err.Error())
-			return 1
-		}
-	}
-
 	if c.flagCreateACLReplicationToken {
 		rules, err := c.aclReplicationRules()
 		if err != nil {
@@ -636,6 +661,22 @@ func (c *Command) Run(args []string) int {
 		}
 	}
 
+	if c.flagCreateControllerToken {
+		rules, err := c.controllerRules()
+		if err != nil {
+			c.log.Error("Error templating controller token rules", "err", err)
+			return 1
+		}
+		// Controller token must be global because config entry writes all
+		// go to the primary datacenter. This means secondary datacenters need
+		// a token that is known by the primary datacenters.
+		err = c.createGlobalACL("controller", rules, consulDC, consulClient)
+		if err != nil {
+			c.log.Error(err.Error())
+			return 1
+		}
+	}
+
 	c.log.Info("server-acl-init completed successfully")
 	return 0
 }
@@ -644,7 +685,7 @@ func (c *Command) Run(args []string) int {
 // reading the Kubernetes Secret with name secretName.
 // If there is no bootstrap token yet, then it returns an empty string (not an error).
 func (c *Command) getBootstrapToken(secretName string) (string, error) {
-	secret, err := c.clientset.CoreV1().Secrets(c.flagK8sNamespace).Get(secretName, metav1.GetOptions{})
+	secret, err := c.clientset.CoreV1().Secrets(c.flagK8sNamespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return "", nil
@@ -741,14 +782,47 @@ func (c *Command) createAnonymousPolicy() bool {
 		// Consul DNS requires the anonymous policy because DNS queries don't
 		// have ACL tokens.
 		(c.flagAllowDNS ||
-			// If the connect auth method and ACL replication token are being
+			// If connect is enabled and the ACL replication token is being
 			// created then we know we're using multi-dc Connect.
 			// In this case the anonymous policy is required because Connect
 			// services in Kubernetes have local tokens which are stripped
 			// on cross-dc API calls. The cross-dc API calls thus use the anonymous
 			// token. Cross-dc API calls are needed by the Connect proxies to talk
 			// cross-dc.
-			(c.flagCreateInjectAuthMethod && c.flagCreateACLReplicationToken))
+			(c.flagCreateInjectToken && c.flagCreateACLReplicationToken))
+}
+
+func (c *Command) validateFlags() error {
+	if len(c.flagServerAddresses) == 0 {
+		return errors.New("-server-address must be set at least once")
+	}
+
+	if c.flagResourcePrefix == "" {
+		return errors.New("-resource-prefix must be set")
+	}
+
+	// For the Consul node name to be discoverable via DNS, it must contain only
+	// dashes and alphanumeric characters. Length is also constrained.
+	// These restrictions match those defined in Consul's agent definition.
+	var invalidDnsRe = regexp.MustCompile(`[^A-Za-z0-9\\-]+`)
+	const maxDNSLabelLength = 63
+
+	if invalidDnsRe.MatchString(c.flagSyncConsulNodeName) {
+		return fmt.Errorf("-sync-consul-node-name=%s is invalid: node name will not be discoverable "+
+			"via DNS due to invalid characters. Valid characters include "+
+			"all alpha-numerics and dashes",
+			c.flagSyncConsulNodeName,
+		)
+	}
+	if len(c.flagSyncConsulNodeName) > maxDNSLabelLength {
+		return fmt.Errorf("-sync-consul-node-name=%s is invalid: node name will not be discoverable "+
+			"via DNS due to it being too long. Valid lengths are between "+
+			"1 and 63 bytes",
+			c.flagSyncConsulNodeName,
+		)
+	}
+
+	return nil
 }
 
 const consulDefaultNamespace = "default"

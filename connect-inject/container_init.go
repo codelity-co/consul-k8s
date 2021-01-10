@@ -10,6 +10,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+const InjectInitContainerName = "consul-connect-inject-init"
+
 type initContainerCommandData struct {
 	ServiceName      string
 	ProxyServiceName string
@@ -193,7 +195,7 @@ func (h *Handler) containerInit(pod *corev1.Pod, k8sNamespace string) (corev1.Co
 	}
 
 	return corev1.Container{
-		Name:  "consul-connect-inject-init",
+		Name:  InjectInitContainerName,
 		Image: h.ImageConsul,
 		Env: []corev1.EnvVar{
 			{
@@ -237,6 +239,9 @@ func (h *Handler) containerInit(pod *corev1.Pod, k8sNamespace string) (corev1.Co
 
 // initContainerCommandTpl is the template for the command executed by
 // the init container.
+// Note: the order of the services in the service.hcl file is important,
+// and the connect-proxy service should come after the "main" service
+// because its alias health check depends on the main service to exist.
 const initContainerCommandTpl = `
 {{- if .ConsulCACert}}
 export CONSUL_HTTP_ADDR="https://${HOST_IP}:8501"
@@ -253,6 +258,27 @@ export CONSUL_GRPC_ADDR="${HOST_IP}:8502"
 # Register the service. The HCL is stored in the volume so that
 # the preStop hook can access it to deregister the service.
 cat <<EOF >/consul/connect-inject/service.hcl
+services {
+  id   = "${SERVICE_ID}"
+  name = "{{ .ServiceName }}"
+  address = "${POD_IP}"
+  port = {{ .ServicePort }}
+  {{- if .ConsulNamespace }}
+  namespace = "{{ .ConsulNamespace }}"
+  {{- end }}
+  {{- if .Tags}}
+  tags = {{.Tags}}
+  {{- end}}
+  meta = {
+    {{- if .Meta}}
+    {{- range $key, $value := .Meta }}
+    {{$key}} = "{{$value}}"
+    {{- end }}
+    {{- end }}
+    pod-name = "${POD_NAME}"
+  }
+}
+
 services {
   id   = "${PROXY_SERVICE_ID}"
   name = "{{ .ProxyServiceName }}"
@@ -312,27 +338,6 @@ services {
   checks {
     name = "Destination Alias"
     alias_service = "${SERVICE_ID}"
-  }
-}
-
-services {
-  id   = "${SERVICE_ID}"
-  name = "{{ .ServiceName }}"
-  address = "${POD_IP}"
-  port = {{ .ServicePort }}
-  {{- if .ConsulNamespace }}
-  namespace = "{{ .ConsulNamespace }}"
-  {{- end }}
-  {{- if .Tags}}
-  tags = {{.Tags}}
-  {{- end}}
-  meta = {
-    {{- if .Meta}}
-    {{- range $key, $value := .Meta }}
-    {{$key}} = "{{$value}}"
-    {{- end }}
-    {{- end }}
-    pod-name = "${POD_NAME}"
   }
 }
 EOF

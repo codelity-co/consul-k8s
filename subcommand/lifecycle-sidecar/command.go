@@ -1,6 +1,7 @@
 package subcommand
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,12 +10,12 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/hashicorp/consul-k8s/subcommand/common"
 	"github.com/hashicorp/consul-k8s/subcommand/flags"
-	"github.com/hashicorp/go-hclog"
 	"github.com/mitchellh/cli"
-	"github.com/prometheus/common/log"
 )
 
 type Command struct {
@@ -48,12 +49,12 @@ func (c *Command) init() {
 	flags.Merge(c.flagSet, c.http.Flags())
 	c.help = flags.Usage(help, c.flagSet)
 
-	// Wait on an interrupt to exit. This channel must be initialized before
+	// Wait on an interrupt or terminate to exit. This channel must be initialized before
 	// Run() is called so that there are no race conditions where the channel
 	// is not defined.
 	if c.sigCh == nil {
 		c.sigCh = make(chan os.Signal, 1)
-		signal.Notify(c.sigCh, os.Interrupt)
+		signal.Notify(c.sigCh, syscall.SIGINT, syscall.SIGTERM)
 	}
 }
 
@@ -74,10 +75,11 @@ func (c *Command) Run(args []string) int {
 		return 1
 	}
 
-	logger := hclog.New(&hclog.LoggerOptions{
-		Level:  hclog.LevelFromString(c.flagLogLevel),
-		Output: os.Stderr,
-	})
+	logger, err := common.Logger(c.flagLogLevel)
+	if err != nil {
+		c.UI.Error(err.Error())
+		return 1
+	}
 
 	// Log initial configuration
 	logger.Info("Command configuration", "service-config", c.flagServiceConfig,
@@ -89,6 +91,18 @@ func (c *Command) Run(args []string) int {
 	c.consulCommand = append(c.consulCommand, c.parseConsulFlags()...)
 	c.consulCommand = append(c.consulCommand, c.flagServiceConfig)
 
+	// ctx that we pass in to the main work loop, signal handling is handled in another thread
+	// due to the length of time it can take for the cmd to complete causing synchronization issues
+	// on shutdown. Also passing a context in so that it can interrupt the cmd and exit cleanly.
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case sig := <-c.sigCh:
+			logger.Info(fmt.Sprintf("%s received, shutting down", sig))
+			cancelFunc()
+			return
+		}
+	}()
 	// The main work loop. We continually re-register our service every
 	// syncPeriod. Consul is smart enough to know when the service hasn't changed
 	// and so won't update any indices. This means we won't be causing a lot
@@ -97,28 +111,27 @@ func (c *Command) Run(args []string) int {
 	//
 	// The loop will only exit when the Pod is shut down and we receive a SIGINT.
 	for {
-		cmd := exec.Command(c.flagConsulBinary, c.consulCommand...)
+		start := time.Now()
+		cmd := exec.CommandContext(ctx, c.flagConsulBinary, c.consulCommand...)
 
 		// Run the command and record the stdout and stderr output
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			logger.Error("failed to sync service", "output", strings.TrimSpace(string(output)), "err", err)
+			logger.Error("failed to sync service", "output", strings.TrimSpace(string(output)), "err", err, "duration", time.Since(start))
 		} else {
-			logger.Info("successfully synced service", "output", strings.TrimSpace(string(output)))
+			logger.Info("successfully synced service", "output", strings.TrimSpace(string(output)), "duration", time.Since(start))
 		}
-
-		// Re-loop after syncPeriod or exit if we receive an interrupt.
 		select {
+		// Re-loop after syncPeriod or exit if we receive interrupt or terminate signals.
 		case <-time.After(c.flagSyncPeriod):
 			continue
-		case <-c.sigCh:
-			log.Info("SIGINT received, shutting down")
+		case <-ctx.Done():
 			return 0
 		}
 	}
 }
 
-// validateFlags validates the flags and returns the logLevel.
+// validateFlags validates the flags.
 func (c *Command) validateFlags() error {
 	if c.flagServiceConfig == "" {
 		return errors.New("-service-config must be set")
@@ -142,10 +155,6 @@ func (c *Command) validateFlags() error {
 	if err != nil {
 		return fmt.Errorf("-consul-binary %q not found: %s", c.flagConsulBinary, err)
 	}
-	logLevel := hclog.LevelFromString(c.flagLogLevel)
-	if logLevel == hclog.NoLevel {
-		return fmt.Errorf("unknown log level: %s", c.flagLogLevel)
-	}
 
 	return nil
 }
@@ -165,7 +174,11 @@ func (c *Command) parseConsulFlags() []string {
 // interrupt sends os.Interrupt signal to the command
 // so it can exit gracefully. This function is needed for tests
 func (c *Command) interrupt() {
-	c.sigCh <- os.Interrupt
+	c.sendSignal(syscall.SIGINT)
+}
+
+func (c *Command) sendSignal(sig os.Signal) {
+	c.sigCh <- sig
 }
 
 func (c *Command) Synopsis() string { return synopsis }
